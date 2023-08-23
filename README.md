@@ -1,3 +1,5 @@
+[![FlipC.org](https://flipc.org/victormico/flipperzero-radio/badge?nowerr=1)](https://flipc.org/victormico/flipperzero-radio?nowerr=1)
+
 # flipperzero-radio
 Application for flipperzero device to control radio boards.
 
