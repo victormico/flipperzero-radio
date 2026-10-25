@@ -14,6 +14,20 @@ App(
                 "TEA5767.c",
             ],
         ),
+        Lib(
+            name="Si4703",
+            cincludes=["."],
+            sources=[
+                "Si4703.c",
+            ],
+        ),
+        Lib(
+            name="RDS",
+            cincludes=["."],
+            sources=[
+                "RDS.c",
+            ],
+        ),
     ],
     fap_icon="radio.png",
     fap_icon_assets="images",
