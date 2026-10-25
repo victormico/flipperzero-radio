@@ -11,6 +11,8 @@
  * https://github.com/mathertel/Radio
  */
 
+#pragma once
+
 #include <furi.h>
 #include <furi_hal.h>
 #include <stdint.h>
@@ -36,7 +38,11 @@
 
 #define REG_3 0x02
 #define REG_3_MS 0x08
+#define REG_3_HLSI 0x10
 #define REG_3_SSL 0x60
+#define REG_3_SSL_LOW 0x20
+#define REG_3_SSL_MID 0x40
+#define REG_3_SSL_HIGH 0x60
 #define REG_3_SUD 0x80
 #define REG_3_STEREO 0x80
 
@@ -50,6 +56,14 @@
 #define REG_5 0x04
 #define REG_5_PLLREF 0x80
 #define REG_5_DTC 0x40
+
+// Bits of the status bytes read back from the chip
+#define STATUS_1_RF 0x80 // A station has been found or the band limit has been reached
+#define STATUS_1_BLF 0x40 // The band limit has been reached during a search
+
+// FM band limits in 10 kHz units (87.50 - 108.00 MHz)
+#define TEA5767_FREQ_MIN 8750
+#define TEA5767_FREQ_MAX 10800
 
 // ----- local variables
 /// Band datatype.
@@ -84,11 +98,42 @@ struct RADIO_INFO {
  * @param i2c address of the device  
  * @return True if present, false if not.
  */
-bool tea5767_is_device_ready();
+bool tea5767_is_device_ready(void);
 bool tea5767_read_registers(uint8_t* buffer);
 bool tea5767_write_registers(uint8_t* buffer);
 bool tea5767_init(uint8_t* buffer);
 bool tea5767_set_mute(uint8_t* buffer, bool mute);
+bool tea5767_set_mono(uint8_t* buffer, bool mono);
+bool tea5767_set_standby(uint8_t* buffer, bool standby);
+
+/**
+ * @brief Read the tuned frequency from the chip
+ * @param buffer write registers, they are left untouched
+ * @param value frequency in 10 kHz units (9530 = 95.30 MHz)
+ */
 bool tea5767_get_frequency(uint8_t* buffer, int* value);
+
+/**
+ * @brief Tune a frequency, stopping any search in progress
+ * @param buffer write registers
+ * @param value frequency in 10 kHz units (9530 = 95.30 MHz)
+ */
 bool tea5767_set_frequency(uint8_t* buffer, int value);
+
+/**
+ * @brief Start the hardware station search
+ * @param buffer write registers
+ * @param value frequency in 10 kHz units where the search starts
+ * @param up search upwards when true, downwards otherwise
+ */
+bool tea5767_seek(uint8_t* buffer, int value, bool up);
+
+/**
+ * @brief Check whether the search started with tea5767_seek has finished
+ * @param done true when the search has stopped
+ * @param band_limit true when it stopped because the band limit was reached
+ * @param value frequency in 10 kHz units where the search stopped
+ */
+bool tea5767_get_seek_status(bool* done, bool* band_limit, int* value);
+
 bool tea5767_get_radio_info(uint8_t* buffer, struct RADIO_INFO* info);
