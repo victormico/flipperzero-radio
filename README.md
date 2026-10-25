@@ -7,15 +7,10 @@ Application for flipperzero device to control radio boards.
 * [TEA5767](https://www.sparkfun.com/datasheets/Wireless/General/TEA5767.pdf)
 
 ## PIN
- - 5V (5V, pin 1)    = VCC
+ - 3V3 (3V3, pin 9)  = VCC
  - GND (GND, pin 18) = GND
  - SCL (C0, pin 16)  = SCL
  - SDA (C1, pin 15)  = SDA
-
-The app turns on the 5V output on pin 1 while it runs (and turns it off again on exit, unless it was
-already on). Bare TEA5767 modules without a regulator also work from 3V3 (pin 9).
-
-The Flipper GPIO pins are 3.3V. If your board has I2C pull-ups to 5V, use a level shifter.
 
 ## Usage
 When the app starts it looks for the radio board on the I2C bus and shows the wiring above until it is found.

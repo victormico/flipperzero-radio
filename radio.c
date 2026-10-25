@@ -117,7 +117,7 @@ static void render_not_found(Canvas* canvas) {
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 42, 23, "SDA -> C1 (15)");
     canvas_draw_str(canvas, 42, 33, "SCL -> C0 (16)");
-    canvas_draw_str(canvas, 42, 43, "VCC -> 5V (1)");
+    canvas_draw_str(canvas, 42, 43, "VCC -> 3V3 (9)");
     canvas_draw_str(canvas, 42, 53, "GND -> GND (18)");
     canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "Searching for device...");
 }
@@ -468,12 +468,6 @@ int32_t radio_app(void* p) {
     Gui* gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(gui, view_port, GuiLayerFullscreen);
 
-    // Power the board from the 5V pin, most TEA5767 boards have a 5V regulator.
-    bool otg_was_enabled = furi_hal_power_is_otg_enabled();
-    if(!otg_was_enabled) {
-        furi_hal_power_enable_otg();
-    }
-
     // Try to find the radio straight away instead of waiting for the first poll.
     furi_mutex_acquire(radio_context->mutex, FuriWaitForever);
     radio_connect(radio_context->data);
@@ -523,9 +517,6 @@ int32_t radio_app(void* p) {
         tea5767_set_standby(data->registers, true);
     }
     settings_save(&data->settings);
-    if(!otg_was_enabled) {
-        furi_hal_power_disable_otg();
-    }
 
     // Free resources
     furi_timer_free(timer);
