@@ -12,6 +12,25 @@ Application for flipperzero device to control radio boards.
  - SCL (C0, pin 16)  = SCL
  - SDA (C1, pin 15)  = SDA
 
+## Usage
+When the app starts it looks for the radio board on the I2C bus and shows the wiring above until it is found.
+Once connected it tunes the last station and shows the frequency, a tuning scale with the saved presets,
+the signal level and whether the station is received in stereo.
+
+| Button       | Short press                | Long press                 |
+|--------------|----------------------------|----------------------------|
+| Left / Right | Tune -/+ 0.1 MHz           | Seek previous/next station |
+| Up / Down    | Next/previous preset       | Up: toggle forced mono     |
+| OK           | Mute / unmute              | Save / remove preset       |
+| Back         | Exit (radio goes to standby) |                          |
+
+The last station, the presets (up to 16) and the mono setting are saved to `apps_data/radio` on the SD card.
+
+## Build
+```
+ufbt
+ufbt launch
+```
 
 ## References
 App inspired by [Radio](https://github.com/mathertel/Radio) project for Arduino
