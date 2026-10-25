@@ -13,16 +13,29 @@
 #include <stdint.h>
 #include "Si4703.h"
 
+// The Flipper doesn't enable pull-ups on the external I2C pins and most Si4703 boards have none,
+// so use the internal ones. They are weak, but enough at 100 kHz with short wires.
+static void si4703_i2c_acquire(void) {
+    furi_hal_i2c_acquire(&furi_hal_i2c_handle_external);
+    furi_hal_gpio_init_ex(
+        SI4703_SCLK_PIN, GpioModeAltFunctionOpenDrain, GpioPullUp, GpioSpeedLow, GpioAltFn4I2C3);
+    furi_hal_gpio_init_ex(
+        SI4703_SDIO_PIN, GpioModeAltFunctionOpenDrain, GpioPullUp, GpioSpeedLow, GpioAltFn4I2C3);
+}
+
 bool si4703_reset(void) {
-    // SEN is tied high, so SDIO low while RST rises selects the 2-wire (I2C) mode.
-    furi_hal_gpio_init(SI4703_SDIO_PIN, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
-    furi_hal_gpio_init(SI4703_RST_PIN, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
+    // SEN is tied high, so SDIO low while RST rises selects the 2-wire (I2C) mode. SCLK is kept high.
+    furi_hal_gpio_write(SI4703_SCLK_PIN, true);
     furi_hal_gpio_write(SI4703_SDIO_PIN, false);
     furi_hal_gpio_write(SI4703_RST_PIN, false);
+    furi_hal_gpio_init(SI4703_SCLK_PIN, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
+    furi_hal_gpio_init(SI4703_SDIO_PIN, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
+    furi_hal_gpio_init(SI4703_RST_PIN, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
     furi_delay_ms(1);
     furi_hal_gpio_write(SI4703_RST_PIN, true);
     furi_delay_ms(1);
-    // Give SDIO back to the I2C bus, it is configured when the bus is acquired.
+    // Give SCLK and SDIO back to the I2C bus, they are configured when the bus is acquired.
+    furi_hal_gpio_init_simple(SI4703_SCLK_PIN, GpioModeAnalog);
     furi_hal_gpio_init_simple(SI4703_SDIO_PIN, GpioModeAnalog);
 
     if(!si4703_is_device_ready()) {
@@ -42,7 +55,7 @@ void si4703_deinit(uint16_t* registers) {
 bool si4703_is_device_ready(void) {
     bool result = false;
 
-    furi_hal_i2c_acquire(&furi_hal_i2c_handle_external);
+    si4703_i2c_acquire();
     if(furi_hal_i2c_is_device_ready(&furi_hal_i2c_handle_external, SI4703_ADR, 5)) {
         result = true;
     }
@@ -54,7 +67,7 @@ bool si4703_read_registers(uint16_t* registers) {
     bool result = false;
     uint8_t buffer[SI4703_REGISTERS * 2];
 
-    furi_hal_i2c_acquire(&furi_hal_i2c_handle_external);
+    si4703_i2c_acquire();
     if(furi_hal_i2c_rx(&furi_hal_i2c_handle_external, SI4703_ADR, buffer, sizeof(buffer), 100)) {
         // Reading always starts at register 0x0A and wraps around after 0x0F.
         for(uint8_t i = 0; i < SI4703_REGISTERS; i++) {
@@ -77,7 +90,7 @@ bool si4703_write_registers(uint16_t* registers) {
         buffer[i * 2 + 1] = registers[SI4703_POWERCFG + i] & 0xFF;
     }
 
-    furi_hal_i2c_acquire(&furi_hal_i2c_handle_external);
+    si4703_i2c_acquire();
     if(furi_hal_i2c_tx(&furi_hal_i2c_handle_external, SI4703_ADR, buffer, sizeof(buffer), 100)) {
         result = true;
     }

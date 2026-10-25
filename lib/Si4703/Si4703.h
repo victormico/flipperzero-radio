@@ -22,6 +22,7 @@
 // Reset pin. The chip only starts in I2C mode when RST rises while SDIO is low.
 #define SI4703_RST_PIN (&gpio_ext_pa4)
 #define SI4703_SDIO_PIN (&gpio_ext_pc1)
+#define SI4703_SCLK_PIN (&gpio_ext_pc0)
 
 // ----- Radio chip specific definitions including the registers
 
