@@ -5,6 +5,8 @@
 #include <storage/storage.h>
 #include <toolbox/saved_struct.h>
 #include <TEA5767.h>
+#include <Si4703.h>
+#include <RDS.h>
 
 #include "radio_icons.h"
 
@@ -14,26 +16,42 @@
 /// Manual tuning step, 100 kHz (frequencies are in 10 kHz units).
 #define FREQUENCY_STEP 10
 
+/// FM band supported by both chips, 87.50 - 108.00 MHz.
+#define FREQUENCY_MIN 8750
+#define FREQUENCY_MAX 10800
+
+#define DEFAULT_VOLUME 8
+
 #define PRESETS_MAX 16
 
 #define SETTINGS_PATH APP_DATA_PATH("radio.settings")
 #define SETTINGS_MAGIC 0x52
-#define SETTINGS_VERSION 1
+#define SETTINGS_VERSION 2
 
-/// Timer period. The seek status is polled on every tick.
-#define TICK_MS 100
-/// Signal level and device presence are polled every few ticks.
-#define POLL_TICKS 5
-/// Give up a station search after 5 seconds.
-#define SEEK_TIMEOUT_TICKS 50
+/// Timer period. The seek status and the Si4703 RDS data are polled on every tick.
+#define TICK_MS 40
+/// Signal level and device presence are polled every 500 ms.
+#define POLL_TICKS (500 / TICK_MS)
+/// Give the TEA5767 100 ms to start searching before reading its ready flag.
+#define SEEK_START_TICKS (100 / TICK_MS + 1)
+/// Give up a station search after 15 seconds.
+#define SEEK_TIMEOUT_TICKS (15000 / TICK_MS)
 /// Status messages are shown for 1.5 seconds.
-#define MESSAGE_TICKS 15
+#define MESSAGE_TICKS (1500 / TICK_MS)
+/// The wiring of each chip is shown for 3 seconds while searching for the board.
+#define WIRING_PAGE_TICKS (3000 / TICK_MS)
 
 typedef enum {
     RadioStateNotFound,
     RadioStateTuned,
     RadioStateSeeking,
 } RadioState;
+
+typedef enum {
+    RadioChipNone,
+    RadioChipTea5767,
+    RadioChipSi4703,
+} RadioChip;
 
 typedef enum {
     RadioEventTypeTick,
@@ -49,6 +67,7 @@ typedef struct {
 typedef struct {
     uint16_t frequency;
     bool mono;
+    uint8_t volume; // Si4703 only.
     uint8_t preset_count;
     uint16_t presets[PRESETS_MAX]; // Sorted ascending.
 } RadioSettings;
@@ -56,17 +75,21 @@ typedef struct {
 typedef struct {
     FuriString* buffer;
     RadioState state;
-    uint8_t registers[5];
+    RadioChip chip;
+    uint8_t tea5767_registers[5];
+    uint16_t si4703_registers[SI4703_REGISTERS];
     RadioSettings settings;
     bool muted;
-    struct RADIO_INFO info;
+    bool stereo;
+    uint8_t signal_bars; // 0 to 5
+    RdsData rds;
     // Station search
     bool seek_up;
     bool seek_wrapped;
     uint16_t seek_origin;
     uint32_t seek_ticks;
     // Transient status line message
-    const char* message;
+    char message[32];
     uint32_t message_ticks;
     uint32_t ticks;
 } RadioData;
@@ -106,25 +129,38 @@ static uint8_t preset_number(RadioSettings* settings, uint16_t frequency) {
 
 // Maps a frequency to an x coordinate of the tuning scale.
 static int32_t scale_x(uint16_t frequency) {
-    return 4 + (frequency - TEA5767_FREQ_MIN) * 119 / (TEA5767_FREQ_MAX - TEA5767_FREQ_MIN);
+    return 4 + (frequency - FREQUENCY_MIN) * 119 / (FREQUENCY_MAX - FREQUENCY_MIN);
 }
 
-static void render_not_found(Canvas* canvas) {
+// Shows the wiring of each supported chip in turn.
+static void render_not_found(Canvas* canvas, uint32_t ticks) {
+    bool si4703 = (ticks / WIRING_PAGE_TICKS) % 2;
+
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str_aligned(canvas, 64, 1, AlignCenter, AlignTop, "Connect TEA5767");
+    canvas_draw_str_aligned(
+        canvas, 64, 1, AlignCenter, AlignTop, si4703 ? "Connect Si4703" : "Connect TEA5767");
     canvas_draw_icon(canvas, 2, 20, &I_radio);
 
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 42, 23, "SDA -> C1 (15)");
-    canvas_draw_str(canvas, 42, 33, "SCL -> C0 (16)");
-    canvas_draw_str(canvas, 42, 43, "VCC -> 3V3 (9)");
-    canvas_draw_str(canvas, 42, 53, "GND -> GND (18)");
-    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "Searching for device...");
+    if(si4703) {
+        // Six wires, so there is no room for the searching line.
+        canvas_draw_str(canvas, 42, 20, "SDIO -> C1 (15)");
+        canvas_draw_str(canvas, 42, 28, "SCLK -> C0 (16)");
+        canvas_draw_str(canvas, 42, 36, "RST -> A4 (4)");
+        canvas_draw_str(canvas, 42, 44, "SEN -> 3V3 (9)");
+        canvas_draw_str(canvas, 42, 52, "3.3V -> 3V3 (9)");
+        canvas_draw_str(canvas, 42, 60, "GND -> GND (18)");
+    } else {
+        canvas_draw_str(canvas, 42, 23, "SDA -> C1 (15)");
+        canvas_draw_str(canvas, 42, 33, "SCL -> C0 (16)");
+        canvas_draw_str(canvas, 42, 43, "VCC -> 3V3 (9)");
+        canvas_draw_str(canvas, 42, 53, "GND -> GND (18)");
+        canvas_draw_str_aligned(
+            canvas, 64, 63, AlignCenter, AlignBottom, "Searching for device...");
+    }
 }
 
-static void render_signal(Canvas* canvas, uint8_t rssi) {
-    // The chip reports the level from 0 to 15, shown as 0 to 5 bars.
-    uint8_t bars = (rssi + 2) / 3;
+static void render_signal(Canvas* canvas, uint8_t bars) {
     for(uint8_t i = 0; i < 5; i++) {
         int32_t x = 108 + i * 4;
         uint8_t height = 2 + i * 2;
@@ -136,21 +172,38 @@ static void render_signal(Canvas* canvas, uint8_t rssi) {
     }
 }
 
-static void render_scale(Canvas* canvas, RadioSettings* settings, uint16_t frequency) {
-    canvas_draw_line(canvas, 4, 55, 123, 55);
+// The compact scale leaves room for the RDS radio text at the bottom.
+static void render_scale(
+    Canvas* canvas,
+    RadioSettings* settings,
+    uint16_t frequency,
+    bool compact) {
+    int32_t y = compact ? 51 : 55;
+    canvas_draw_line(canvas, 4, y, 123, y);
     for(uint16_t mhz = 88; mhz <= 108; mhz++) {
         int32_t x = scale_x(mhz * 100);
-        canvas_draw_line(canvas, x, (mhz % 5 == 0) ? 51 : 53, x, 54);
+        canvas_draw_line(canvas, x, y - ((mhz % 5 == 0) ? 4 : 2), x, y - 1);
     }
 
     for(uint8_t i = 0; i < settings->preset_count; i++) {
-        canvas_draw_box(canvas, scale_x(settings->presets[i]) - 1, 58, 3, 2);
+        canvas_draw_box(canvas, scale_x(settings->presets[i]) - 1, y + (compact ? 2 : 3), 3, 2);
     }
 
     // Needle
     int32_t x = scale_x(frequency);
-    canvas_draw_line(canvas, x, 47, x, 61);
-    canvas_draw_line(canvas, x - 1, 47, x + 1, 47);
+    int32_t top = y - (compact ? 6 : 8);
+    canvas_draw_line(canvas, x, top, x, y + (compact ? 3 : 6));
+    canvas_draw_line(canvas, x - 1, top, x + 1, top);
+}
+
+// Scrolls the text when it doesn't fit the screen.
+static void render_text(Canvas* canvas, const char* text, uint32_t ticks) {
+    uint16_t width = canvas_string_width(canvas, text);
+    if(width <= 128) {
+        canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, text);
+    } else {
+        canvas_draw_str(canvas, 128 - ticks % (width + 128), 63, text);
+    }
 }
 
 static void render_radio(Canvas* canvas, RadioData* data) {
@@ -160,8 +213,13 @@ static void render_radio(Canvas* canvas, RadioData* data) {
     // Status bar
     canvas_set_font(canvas, FontSecondary);
     if(data->state == RadioStateTuned) {
-        canvas_draw_str(canvas, 0, 8, data->info.stereo ? "STEREO" : "MONO");
-        render_signal(canvas, data->info.rssi);
+        canvas_draw_str(canvas, 0, 8, data->stereo ? "STEREO" : "MONO");
+        render_signal(canvas, data->signal_bars);
+    }
+    if(data->chip == RadioChipSi4703) {
+        furi_string_printf(data->buffer, "Vol %d", settings->volume);
+        canvas_draw_str_aligned(
+            canvas, 104, 8, AlignRight, AlignBottom, furi_string_get_cstr(data->buffer));
     }
     if(data->muted) {
         uint16_t width = canvas_string_width(canvas, "MUTE") + 4;
@@ -188,15 +246,28 @@ static void render_radio(Canvas* canvas, RadioData* data) {
     if(data->state == RadioStateSeeking) {
         canvas_draw_str_aligned(
             canvas, 64, 42, AlignCenter, AlignBottom, data->seek_up ? "Seeking >>" : "<< Seeking");
-    } else if(data->message) {
+    } else if(data->message_ticks > 0) {
         canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignBottom, data->message);
+    } else if(data->rds.ps[0]) {
+        // Station name from RDS
+        if(preset) {
+            furi_string_printf(data->buffer, "P%d", preset);
+            canvas_draw_str(canvas, 0, 42, furi_string_get_cstr(data->buffer));
+        }
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignBottom, data->rds.ps);
+        canvas_set_font(canvas, FontSecondary);
     } else if(preset) {
         furi_string_printf(data->buffer, "Preset %d", preset);
         canvas_draw_str_aligned(
             canvas, 64, 42, AlignCenter, AlignBottom, furi_string_get_cstr(data->buffer));
     }
 
-    render_scale(canvas, settings, frequency);
+    bool has_text = data->state == RadioStateTuned && data->rds.text[0];
+    render_scale(canvas, settings, frequency, has_text);
+    if(has_text) {
+        render_text(canvas, data->rds.text, data->ticks);
+    }
 }
 
 // Invoked by the draw callback to render the screen. We render our UI on the callback thread.
@@ -209,7 +280,7 @@ static void render_callback(Canvas* canvas, void* ctx) {
 
     RadioData* data = radio_context->data;
     if(data->state == RadioStateNotFound) {
-        render_not_found(canvas);
+        render_not_found(canvas, data->ticks);
     } else {
         render_radio(canvas, data);
     }
@@ -221,10 +292,11 @@ static void render_callback(Canvas* canvas, void* ctx) {
 static void settings_load(RadioSettings* settings) {
     if(!saved_struct_load(
            SETTINGS_PATH, settings, sizeof(RadioSettings), SETTINGS_MAGIC, SETTINGS_VERSION) ||
-       settings->frequency < TEA5767_FREQ_MIN || settings->frequency > TEA5767_FREQ_MAX ||
-       settings->preset_count > PRESETS_MAX) {
+       settings->frequency < FREQUENCY_MIN || settings->frequency > FREQUENCY_MAX ||
+       settings->preset_count > PRESETS_MAX || settings->volume > SI4703_VOLUME_MAX) {
         memset(settings, 0, sizeof(RadioSettings));
         settings->frequency = DEFAULT_STATION;
+        settings->volume = DEFAULT_VOLUME;
     }
 }
 
@@ -233,21 +305,98 @@ static void settings_save(RadioSettings* settings) {
         SETTINGS_PATH, settings, sizeof(RadioSettings), SETTINGS_MAGIC, SETTINGS_VERSION);
 }
 
-static void show_message(RadioData* data, const char* message) {
-    data->message = message;
+static void show_message(RadioData* data, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(data->message, sizeof(data->message), format, args);
+    va_end(args);
     data->message_ticks = MESSAGE_TICKS;
+}
+
+// The chip_* functions hide the differences between the supported chips.
+
+static bool chip_tune(RadioData* data, uint16_t frequency) {
+    if(data->chip == RadioChipSi4703) {
+        return si4703_set_frequency(data->si4703_registers, frequency);
+    }
+    return tea5767_set_frequency(data->tea5767_registers, frequency);
+}
+
+// The TEA5767 searches from the given frequency, the Si4703 from the tuned one.
+static bool chip_seek(RadioData* data, uint16_t frequency) {
+    if(data->chip == RadioChipSi4703) {
+        return si4703_seek(data->si4703_registers, data->seek_up);
+    }
+    return tea5767_seek(data->tea5767_registers, frequency, data->seek_up);
+}
+
+static bool chip_get_seek_status(RadioData* data, bool* done, bool* band_limit, int* frequency) {
+    if(data->chip == RadioChipSi4703) {
+        return si4703_get_seek_status(data->si4703_registers, done, band_limit, frequency);
+    }
+    return tea5767_get_seek_status(done, band_limit, frequency);
+}
+
+static bool chip_set_mute(RadioData* data, bool mute) {
+    if(data->chip == RadioChipSi4703) {
+        return si4703_set_mute(data->si4703_registers, mute);
+    }
+    return tea5767_set_mute(data->tea5767_registers, mute);
+}
+
+static bool chip_set_mono(RadioData* data, bool mono) {
+    if(data->chip == RadioChipSi4703) {
+        return si4703_set_mono(data->si4703_registers, mono);
+    }
+    return tea5767_set_mono(data->tea5767_registers, mono);
+}
+
+// Reads the signal level, stereo indicator and RDS data.
+static bool chip_update_status(RadioData* data) {
+    if(data->chip == RadioChipSi4703) {
+        uint8_t rssi = 0;
+        uint16_t blocks[4];
+        uint8_t errors[4];
+        if(!si4703_get_status(data->si4703_registers, &rssi, &data->stereo)) {
+            return false;
+        }
+        // The level is reported in dBµV, strong stations are above 50.
+        data->signal_bars = MIN(rssi / 10, 5);
+        if(si4703_get_rds(data->si4703_registers, blocks, errors)) {
+            rds_process(&data->rds, blocks, errors);
+        }
+        return true;
+    }
+
+    struct RADIO_INFO info;
+    if(!tea5767_get_radio_info(data->tea5767_registers, &info)) {
+        return false;
+    }
+    // The level is reported from 0 to 15.
+    data->signal_bars = (info.rssi + 2) / 3;
+    data->stereo = info.stereo;
+    return true;
+}
+
+static void chip_stop(RadioData* data) {
+    if(data->chip == RadioChipSi4703) {
+        // Also releases the reset pin, so do it even if the chip is gone.
+        si4703_deinit(data->si4703_registers);
+    } else if(data->chip == RadioChipTea5767 && data->state != RadioStateNotFound) {
+        tea5767_set_standby(data->tea5767_registers, true);
+    }
 }
 
 static void tune(RadioData* data, uint16_t frequency) {
     data->settings.frequency = frequency;
-    data->state = tea5767_set_frequency(data->registers, frequency) ? RadioStateTuned :
-                                                                      RadioStateNotFound;
+    rds_reset(&data->rds);
+    data->state = chip_tune(data, frequency) ? RadioStateTuned : RadioStateNotFound;
 }
 
 static void seek_start(RadioData* data, uint16_t frequency) {
     data->seek_ticks = 0;
-    data->state = tea5767_seek(data->registers, frequency, data->seek_up) ? RadioStateSeeking :
-                                                                            RadioStateNotFound;
+    rds_reset(&data->rds);
+    data->state = chip_seek(data, frequency) ? RadioStateSeeking : RadioStateNotFound;
 }
 
 static void seek(RadioData* data, bool up) {
@@ -257,13 +406,16 @@ static void seek(RadioData* data, bool up) {
     data->seek_origin = frequency;
 
     // Start next to the current station so the search doesn't stop on it again.
-    if(up && frequency + FREQUENCY_STEP <= TEA5767_FREQ_MAX) {
+    if(data->chip == RadioChipSi4703) {
+        // The Si4703 skips the tuned station and wraps around the band by itself.
+        seek_start(data, frequency);
+    } else if(up && frequency + FREQUENCY_STEP <= FREQUENCY_MAX) {
         seek_start(data, frequency + FREQUENCY_STEP);
-    } else if(!up && frequency - FREQUENCY_STEP >= TEA5767_FREQ_MIN) {
+    } else if(!up && frequency - FREQUENCY_STEP >= FREQUENCY_MIN) {
         seek_start(data, frequency - FREQUENCY_STEP);
     } else {
         data->seek_wrapped = true;
-        seek_start(data, up ? TEA5767_FREQ_MIN : TEA5767_FREQ_MAX);
+        seek_start(data, up ? FREQUENCY_MIN : FREQUENCY_MAX);
     }
 }
 
@@ -272,28 +424,27 @@ static void seek_update(RadioData* data) {
     bool band_limit = false;
     int frequency = 0;
 
-    // Give the chip a full tick to start searching before reading its ready flag.
-    if(++data->seek_ticks < 2) {
+    if(++data->seek_ticks < SEEK_START_TICKS) {
         return;
     }
 
-    if(!tea5767_get_seek_status(&done, &band_limit, &frequency)) {
+    if(!chip_get_seek_status(data, &done, &band_limit, &frequency)) {
         data->state = RadioStateNotFound;
         return;
     }
 
-    if(done && band_limit && !data->seek_wrapped) {
+    if(done && band_limit && data->chip == RadioChipTea5767 && !data->seek_wrapped) {
         // Reached the end of the band, continue from the other end.
         data->seek_wrapped = true;
-        seek_start(data, data->seek_up ? TEA5767_FREQ_MIN : TEA5767_FREQ_MAX);
+        seek_start(data, data->seek_up ? FREQUENCY_MIN : FREQUENCY_MAX);
     } else if(done && !band_limit) {
         // Snap the station to the 100 kHz grid.
         frequency = (frequency + FREQUENCY_STEP / 2) / FREQUENCY_STEP * FREQUENCY_STEP;
-        tune(data, CLAMP(frequency, TEA5767_FREQ_MAX, TEA5767_FREQ_MIN));
+        tune(data, CLAMP(frequency, FREQUENCY_MAX, FREQUENCY_MIN));
     } else if(done || data->seek_ticks > SEEK_TIMEOUT_TICKS) {
         tune(data, data->seek_origin);
         show_message(data, "No station found");
-    } else if(frequency >= TEA5767_FREQ_MIN && frequency <= TEA5767_FREQ_MAX) {
+    } else if(frequency >= FREQUENCY_MIN && frequency <= FREQUENCY_MAX) {
         // Show the needle moving while searching.
         data->settings.frequency = frequency;
     }
@@ -301,10 +452,10 @@ static void seek_update(RadioData* data) {
 
 static void step(RadioData* data, bool up) {
     int frequency = data->settings.frequency + (up ? FREQUENCY_STEP : -FREQUENCY_STEP);
-    if(frequency > TEA5767_FREQ_MAX) {
-        frequency = TEA5767_FREQ_MIN;
-    } else if(frequency < TEA5767_FREQ_MIN) {
-        frequency = TEA5767_FREQ_MAX;
+    if(frequency > FREQUENCY_MAX) {
+        frequency = FREQUENCY_MIN;
+    } else if(frequency < FREQUENCY_MIN) {
+        frequency = FREQUENCY_MAX;
     }
     tune(data, frequency);
 }
@@ -327,6 +478,19 @@ static void next_preset(RadioData* data, bool up) {
         }
     }
     tune(data, frequency);
+}
+
+static void change_volume(RadioData* data, bool up) {
+    RadioSettings* settings = &data->settings;
+    if(up && settings->volume < SI4703_VOLUME_MAX) {
+        settings->volume++;
+    } else if(!up && settings->volume > 0) {
+        settings->volume--;
+    }
+    show_message(data, "Volume %d/%d", settings->volume, SI4703_VOLUME_MAX);
+    if(!si4703_set_volume(data->si4703_registers, settings->volume)) {
+        data->state = RadioStateNotFound;
+    }
 }
 
 static void toggle_preset(RadioData* data) {
@@ -358,15 +522,29 @@ static void toggle_preset(RadioData* data) {
 
 // Our main loop invokes this method after acquiring the mutex, so we can safely access the protected data.
 static void radio_connect(RadioData* data) {
-    if(!tea5767_is_device_ready() || !tea5767_init(data->registers)) {
+    if(tea5767_is_device_ready()) {
+        if(!tea5767_init(data->tea5767_registers)) {
+            return;
+        }
+        data->chip = RadioChipTea5767;
+        if(data->muted) {
+            data->tea5767_registers[REG_1] |= REG_1_MUTE;
+        }
+        if(data->settings.mono) {
+            data->tea5767_registers[REG_3] |= REG_3_MS;
+        }
+    } else if(si4703_reset()) {
+        if(!si4703_init(data->si4703_registers)) {
+            return;
+        }
+        data->chip = RadioChipSi4703;
+        if(!si4703_set_volume(data->si4703_registers, data->settings.volume) ||
+           !si4703_set_mute(data->si4703_registers, data->muted) ||
+           !si4703_set_mono(data->si4703_registers, data->settings.mono)) {
+            return;
+        }
+    } else {
         return;
-    }
-
-    if(data->muted) {
-        data->registers[REG_1] |= REG_1_MUTE;
-    }
-    if(data->settings.mono) {
-        data->registers[REG_3] |= REG_3_MS;
     }
     tune(data, data->settings.frequency);
 }
@@ -374,16 +552,19 @@ static void radio_connect(RadioData* data) {
 // Our main loop invokes this method after acquiring the mutex, so we can safely access the protected data.
 static void radio_tick(RadioData* data) {
     data->ticks++;
-    if(data->message_ticks > 0 && --data->message_ticks == 0) {
-        data->message = NULL;
+    if(data->message_ticks > 0) {
+        data->message_ticks--;
     }
 
     if(data->state == RadioStateSeeking) {
         seek_update(data);
-    } else if(data->ticks % POLL_TICKS == 0) {
-        if(data->state == RadioStateNotFound) {
+    } else if(data->state == RadioStateNotFound) {
+        if(data->ticks % POLL_TICKS == 0) {
             radio_connect(data);
-        } else if(!tea5767_get_radio_info(data->registers, &data->info)) {
+        }
+    } else if(data->chip == RadioChipSi4703 || data->ticks % POLL_TICKS == 0) {
+        // The Si4703 is read on every tick to catch all the RDS groups.
+        if(!chip_update_status(data)) {
             data->state = RadioStateNotFound;
         }
     }
@@ -406,11 +587,15 @@ static void radio_input(RadioData* data, InputEvent* input) {
             break;
         case InputKeyUp:
         case InputKeyDown:
-            next_preset(data, input->key == InputKeyUp);
+            if(data->chip == RadioChipSi4703) {
+                change_volume(data, input->key == InputKeyUp);
+            } else {
+                next_preset(data, input->key == InputKeyUp);
+            }
             break;
         case InputKeyOk:
             data->muted = !data->muted;
-            if(!tea5767_set_mute(data->registers, data->muted)) {
+            if(!chip_set_mute(data, data->muted)) {
                 data->state = RadioStateNotFound;
             }
             break;
@@ -427,10 +612,16 @@ static void radio_input(RadioData* data, InputEvent* input) {
             seek(data, input->key == InputKeyRight);
             break;
         case InputKeyUp:
-            data->settings.mono = !data->settings.mono;
-            show_message(data, data->settings.mono ? "Forced mono" : "Stereo allowed");
-            if(!tea5767_set_mono(data->registers, data->settings.mono)) {
-                data->state = RadioStateNotFound;
+        case InputKeyDown:
+            if(data->chip == RadioChipSi4703) {
+                // Up and down are used for the volume, so presets move to a long press.
+                next_preset(data, input->key == InputKeyUp);
+            } else if(input->key == InputKeyUp) {
+                data->settings.mono = !data->settings.mono;
+                show_message(data, data->settings.mono ? "Forced mono" : "Stereo allowed");
+                if(!chip_set_mono(data, data->settings.mono)) {
+                    data->state = RadioStateNotFound;
+                }
             }
             break;
         case InputKeyOk:
@@ -513,9 +704,7 @@ int32_t radio_app(void* p) {
     if(data->state == RadioStateSeeking) {
         data->settings.frequency = data->seek_origin;
     }
-    if(data->state != RadioStateNotFound) {
-        tea5767_set_standby(data->registers, true);
-    }
+    chip_stop(data);
     settings_save(&data->settings);
 
     // Free resources
